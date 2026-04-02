@@ -157,3 +157,9 @@ auto3dseg/notebooks/datalist.json
 *.png
 *.np*
 *.pt
+
+# detection training
+detection/data/
+detection/tfevent_train/
+detection/trained_models/
+detection/result/

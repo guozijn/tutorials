@@ -17,8 +17,8 @@ import sys
 
 def main():
     #  ------------- Modification starts -------------
-    raw_data_base_dir = "/orig_datasets/"  # the directory of the raw images
-    resampled_data_base_dir = "/datasets/"  # the directory of the resampled images
+    raw_data_base_dir = "data/orig_datasets"  # the directory of the raw images
+    resampled_data_base_dir = "data/resampled_data/"  # the directory of the resampled images
     downloaded_datasplit_dir = "LUNA16_datasplit"  # the directory of downloaded data split files
 
     out_trained_models_dir = "trained_models"  # the directory to save trained model weights
