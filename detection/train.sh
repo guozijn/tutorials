@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# Enviroment
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 CURRENT_DATE=$(date +"%Y-%m-%d")
 LOG_FILE="training.$CURRENT_DATE.log"
 
