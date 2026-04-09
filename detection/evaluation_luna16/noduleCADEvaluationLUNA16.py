@@ -186,13 +186,13 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
             if len(list(nodules.keys())) > maxNumberOfCADMarks:
                 # make a list of all probabilities
                 probs = []
-                for keytemp, noduletemp in nodules.items():
+                for keytemp, noduletemp in list(nodules.items()):
                     probs.append(float(noduletemp.CADprobability))
                 probs.sort(reverse=True) # sort from large to small
                 probThreshold = probs[maxNumberOfCADMarks]
                 nodules2 = {}
                 nrNodules2 = 0
-                for keytemp, noduletemp in nodules.items():
+                for keytemp, noduletemp in list(nodules.items()):
                     if nrNodules2 >= maxNumberOfCADMarks:
                         break
                     if float(noduletemp.CADprobability) > probThreshold:
@@ -268,7 +268,7 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
 
             found = False
             noduleMatches = []
-            for key, candidate in candidates.items():
+            for key, candidate in list(candidates.items()):
                 x2 = float(candidate.coordX)
                 y2 = float(candidate.coordY)
                 z2 = float(candidate.coordZ)
@@ -318,7 +318,7 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
                     nodNoCandFile.write("%s,%s,%s,%s,%s,%.9f,%s\n" % (seriesuid, noduleAnnot.id, noduleAnnot.coordX, noduleAnnot.coordY, noduleAnnot.coordZ, float(noduleAnnot.diameter_mm), str(-1)))
 
         # add all false positives to the vectors
-        for key, candidate3 in candidates2.items():
+        for key, candidate3 in list(candidates2.items()):
             candFPs += 1
             FROCGTList.append(0.0)
             FROCProbList.append(float(candidate3.CADprobability))
@@ -400,13 +400,13 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
         plt.title('FROC performance - %s' % (CADSystemName))
         
         if bLogPlot:
-            plt.xscale('log', basex=2)
+            plt.xscale('log', base=2)
             ax.xaxis.set_major_formatter(FixedFormatter([0.125,0.25,0.5,1,2,4,8]))
         
         # set your ticks manually
         ax.xaxis.set_ticks([0.125,0.25,0.5,1,2,4,8])
         ax.yaxis.set_ticks(np.arange(0, 1.1, 0.1))
-        plt.grid(b=True, which='both')
+        plt.grid(visible=True, which='both')
         plt.tight_layout()
 
         plt.savefig(os.path.join(outputDir, "froc_%s.png" % CADSystemName), bbox_inches=0, dpi=300)
