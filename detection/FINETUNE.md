@@ -108,13 +108,73 @@ Recommended experiment:
 
 The validation set is for checkpoint selection. The test set is for final reporting only.
 
+To reuse the LUNA16 official evaluation script on local test data, prepare local versions of the required files:
+
+```text
+local_annotations.csv
+local_annotations_excluded.csv
+local_seriesuids.csv
+local_result.csv
+```
+
+Expected formats:
+
+```text
+annotations.csv:
+seriesuid,coordX,coordY,coordZ,diameter_mm
+
+annotations_excluded.csv:
+seriesuid,coordX,coordY,coordZ,diameter_mm
+
+seriesuids.csv:
+one seriesuid per line
+
+result.csv:
+seriesuid,coordX,coordY,coordZ,probability
+```
+
+If the local datalist uses `cccwhd` boxes, convert each ground-truth box as:
+
+```text
+coordX = center x
+coordY = center y
+coordZ = center z
+diameter_mm = mean(width, height, depth)
+```
+
+For model predictions, run inference on the local test datalist, then convert the output JSON to CSV with:
+
+```bash
+python3 luna16_post_combine_cross_fold_results.py \
+  -i ./result/result_local_test.json \
+  -o ./result/result_local_test.csv
+```
+
+Then run the official evaluation script:
+
+```bash
+python3 ./evaluation_luna16/noduleCADEvaluationLUNA16.py \
+  ./local_eval/annotations.csv \
+  ./local_eval/annotations_excluded.csv \
+  ./local_eval/seriesuids.csv \
+  ./result/result_local_test.csv \
+  ./result/eval_local_test_scores
+```
+
+Finally, extract the seven LUNA16 sensitivity points and CPM:
+
+```bash
+./extract_luna16_froc_metrics.py ./result/eval_local_test_scores
+```
+
+Use this evaluation when local annotations follow the LUNA16 style of nodule centers and diameters. If strict 3D bounding box quality is required, also report IoU-based metrics such as mAP or mAR.
+
 ## 6. Annotation Notes
 
 Make sure local annotations follow a clear policy:
 
 ```text
 - same minimum nodule size threshold
-- consistent benign/malignant inclusion rules
 - complete annotation of visible target nodules
 - same coordinate convention as the training config
 ```
