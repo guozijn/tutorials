@@ -13,14 +13,26 @@
 
 set -euo pipefail
 
-RESULT_JSON="${1:-./result/result_luna16_fold0.json}"
-DATASET_JSON="${2:-./LUNA16_datasplit/dataset_fold0.json}"
-ANNOTATIONS_CSV="${3:-./evaluation_luna16/annotations/annotations.csv}"
-ANNOTATIONS_EXCLUDED_CSV="${4:-./evaluation_luna16/annotations/annotations_excluded.csv}"
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <fold> [annotations_csv] [annotations_excluded_csv]" >&2
+  echo "Example: $0 0" >&2
+  exit 1
+fi
 
-RESULT_CSV="./result/result_luna16_fold0.csv"
-SERIESUIDS_CSV="./result/seriesuids_fold0.csv"
-OUTPUT_DIR="./result/eval_luna16_fold0_scores"
+FOLD="$1"
+ANNOTATIONS_CSV="${2:-./evaluation_luna16/annotations/annotations.csv}"
+ANNOTATIONS_EXCLUDED_CSV="${3:-./evaluation_luna16/annotations/annotations_excluded.csv}"
+
+if ! [[ "${FOLD}" =~ ^[0-9]+$ ]]; then
+  echo "Fold must be a non-negative integer, got: ${FOLD}" >&2
+  exit 1
+fi
+
+RESULT_JSON="./result/result_luna16_fold${FOLD}.json"
+DATASET_JSON="./LUNA16_datasplit/dataset_fold${FOLD}.json"
+RESULT_CSV="./result/result_luna16_fold${FOLD}.csv"
+SERIESUIDS_CSV="./result/seriesuids_fold${FOLD}.csv"
+OUTPUT_DIR="./result/eval_luna16_fold${FOLD}_scores"
 
 python ./luna16_post_combine_cross_fold_results.py \
   -i "${RESULT_JSON}" \
