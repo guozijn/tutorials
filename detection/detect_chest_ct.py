@@ -6,15 +6,11 @@ RetinaNet detector on each file, and writes results in LUNA16 CSV format:
 
     seriesuid, coordX, coordY, coordZ, diameter_mm
 
-Preprocessing is parallelised via DataLoader workers. When multiple GPUs are
-available the file list is split evenly across GPUs using separate processes
-spawned with torch.multiprocessing.
+Results are written to the CSV after each scan so progress is preserved
+if the process is interrupted.
 
 Example (CLI):
     python3 detect_chest_ct.py --input_dir ~/chest_ct_nii
-
-Multi-GPU:
-    python3 detect_chest_ct.py --input_dir ~/chest_ct_nii --num_gpus 4
 
 Via MONAI bundle CLI:
     python3 -m monai.bundle run \\
@@ -27,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import glob
 import os
 import sys
@@ -34,52 +31,142 @@ import time
 from pathlib import Path
 
 import torch
-import torch.multiprocessing as mp
 
 BUNDLE_DIR = Path(os.path.expanduser(
     "~/Code/pulmodex/checkpoints/lung_nodule_ct_detection"
 ))
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUTPUT = str(SCRIPT_DIR / "chest_ct_nii.csv")
+CSV_HEADER = ["seriesuid", "coordX", "coordY", "coordZ", "diameter_mm", "score"]
 
 
-# ---------------------------------------------------------------------------
-# Per-GPU worker (runs in a separate process for each GPU)
-# ---------------------------------------------------------------------------
+def _seriesuid_from_path(path: str) -> str:
+    seriesuid = os.path.basename(path)
+    if seriesuid.endswith(".nii.gz"):
+        seriesuid = seriesuid[: -len(".nii.gz")]
+    return seriesuid
+
+
+def _progress_path(output_csv: str) -> str:
+    return f"{output_csv}.progress.tsv"
+
+
+def _flush_file(file_obj) -> None:
+    file_obj.flush()
+    os.fsync(file_obj.fileno())
+
+
+def _count_existing_rows(output_csv: str) -> int:
+    if not os.path.exists(output_csv) or os.path.getsize(output_csv) == 0:
+        return 0
+
+    with open(output_csv, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header != CSV_HEADER:
+            raise ValueError(
+                f"{output_csv} has an unexpected header: {header!r}. "
+                "Use --overwrite to recreate it."
+            )
+        return sum(1 for _ in reader)
+
+
+def _bootstrap_completed_seriesuids(output_csv: str) -> set[str]:
+    completed: set[str] = set()
+    if not os.path.exists(output_csv) or os.path.getsize(output_csv) == 0:
+        return completed
+
+    with open(output_csv, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header != CSV_HEADER:
+            raise ValueError(
+                f"{output_csv} has an unexpected header: {header!r}. "
+                "Use --overwrite to recreate it."
+            )
+        for row in reader:
+            if row:
+                completed.add(row[0])
+    return completed
+
+
+def _load_completed_seriesuids(output_csv: str, overwrite: bool) -> tuple[set[str], bool]:
+    progress_path = _progress_path(output_csv)
+    if overwrite:
+        return set(), False
+
+    if os.path.exists(progress_path) and os.path.getsize(progress_path) > 0:
+        completed: set[str] = set()
+        with open(progress_path, newline="") as f:
+            reader = csv.reader(f, delimiter="\t")
+            header = next(reader, None)
+            if header != ["seriesuid", "num_detections"]:
+                raise ValueError(
+                    f"{progress_path} has an unexpected header: {header!r}. "
+                    "Delete it or use --overwrite."
+                )
+            for row in reader:
+                if row:
+                    completed.add(row[0])
+        return completed, False
+
+    completed = _bootstrap_completed_seriesuids(output_csv)
+    if completed:
+        print(
+            "No progress sidecar found; bootstrapping resume state from the existing CSV. "
+            "This can only infer scans that already have at least one detection.",
+            flush=True,
+        )
+    return completed, bool(completed)
+
+
+def _open_output_files(output_csv: str, overwrite: bool):
+    os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
+
+    csv_exists = os.path.exists(output_csv) and os.path.getsize(output_csv) > 0
+    csv_mode = "a" if csv_exists and not overwrite else "w"
+    csv_file = open(output_csv, csv_mode, newline="")
+    writer = csv.writer(csv_file)
+    if csv_mode == "w":
+        writer.writerow(CSV_HEADER)
+        _flush_file(csv_file)
+
+    progress_path = _progress_path(output_csv)
+    progress_exists = os.path.exists(progress_path) and os.path.getsize(progress_path) > 0
+    progress_mode = "a" if progress_exists and not overwrite else "w"
+    progress_file = open(progress_path, progress_mode, newline="")
+    progress_writer = csv.writer(progress_file, delimiter="\t")
+    if progress_mode == "w":
+        progress_writer.writerow(["seriesuid", "num_detections"])
+        _flush_file(progress_file)
+
+    return csv_file, writer, progress_file, progress_writer
+
 
 def _infer_worker(
-    rank: int,
     file_paths: list[str],
     bundle_dir: str,
+    output_csv: str,
     score_thresh: float,
     nms_thresh: float,
     num_workers: int,
     amp: bool,
-    result_queue,
-) -> None:
-    """
-    Loads the bundle on device *rank*, runs inference on *file_paths*, and
-    pushes (rank, rows) into *result_queue*.
-    """
-    from pathlib import Path
-
+    overwrite: bool,
+) -> int:
     bundle_dir = Path(bundle_dir)
-    # Insert the bundle root so that "scripts" is importable as a package
-    # (bundle_root/scripts/__init__.py exists).
     sys.path.insert(0, str(bundle_dir))
 
     from monai.bundle import ConfigParser
-    from monai.data import DataLoader, Dataset
-    from monai.data.utils import no_collation
     from scripts.detection_inferer import RetinaNetInferer
 
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    print(f"[GPU {rank}] {device}  —  {len(file_paths)} file(s)", flush=True)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"{device}  —  {len(file_paths)} file(s)", flush=True)
+    if num_workers:
+        print(
+            f"Ignoring num_workers={num_workers}; scans are processed serially to reduce peak memory.",
+            flush=True,
+        )
 
-    # ------------------------------------------------------------------
-    # Build all bundle components through ConfigParser so the bundle's
-    # default transforms and architecture are used without duplication.
-    # ------------------------------------------------------------------
     parser = ConfigParser()
     parser.read_config(str(bundle_dir / "configs" / "inference.json"))
 
@@ -91,23 +178,13 @@ def _infer_worker(
     # to RAS, matching the convention used during training.
     parser["bundle_root"] = str(bundle_dir)
     parser["whether_raw_luna16"] = True
-    parser["device"] = f"$torch.device('cuda:{rank}' if torch.cuda.is_available() else 'cpu')"
+    parser["device"] = "$torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')"
     parser["test_datalist"] = [{"image": f} for f in file_paths]
-    parser["load_pretrain"] = False   # checkpoint is loaded manually below
+    parser["load_pretrain"] = False
     parser["amp"] = amp
 
     preprocessing = parser.get_parsed_content("preprocessing")
     postprocessing = parser.get_parsed_content("postprocessing")
-
-    dataset = Dataset(data=[{"image": f} for f in file_paths], transform=preprocessing)
-    loader = DataLoader(
-        dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=no_collation,
-    )
 
     network = parser.get_parsed_content("network")
     detector = parser.get_parsed_content("detector")
@@ -116,7 +193,6 @@ def _infer_worker(
     # settings as side effects onto the detector.
     parser.get_parsed_content("detector_ops")
 
-    # Allow caller-supplied thresholds to override the bundle defaults.
     detector.set_box_selector_parameters(
         score_thresh=score_thresh,
         topk_candidates_per_level=1000,
@@ -129,74 +205,100 @@ def _infer_worker(
     ckpt_path = bundle_dir / "models" / "model.pt"
     state_dict = torch.load(str(ckpt_path), map_location=device, weights_only=False)
     network.load_state_dict(state_dict)
-    print(f"[GPU {rank}] Loaded checkpoint: {ckpt_path}", flush=True)
+    print(f"Loaded checkpoint: {ckpt_path}", flush=True)
 
     network.eval()
     inferer = RetinaNetInferer(detector=detector, force_sliding_window=False)
 
-    # ------------------------------------------------------------------
-    # Inference loop
-    # ------------------------------------------------------------------
-    rows: list[list] = []
-    t0 = time.time()
-    total = len(file_paths)
+    completed_seriesuids, bootstrap_progress = _load_completed_seriesuids(
+        output_csv, overwrite=overwrite
+    )
+    pending_paths = [
+        path for path in file_paths
+        if _seriesuid_from_path(path) not in completed_seriesuids
+    ]
+    existing_detection_count = 0 if overwrite else _count_existing_rows(output_csv)
+    skipped = len(file_paths) - len(pending_paths)
+    print(
+        f"Resume state: {skipped} completed, {len(pending_paths)} remaining, "
+        f"{existing_detection_count} detection row(s) already in CSV.",
+        flush=True,
+    )
 
-    with torch.no_grad():
-        for done, batch in enumerate(loader, start=1):
-            filenames = [d["image"].meta["filename_or_obj"] for d in batch]
+    csv_file, writer, progress_file, progress_writer = _open_output_files(
+        output_csv, overwrite=overwrite
+    )
+    if bootstrap_progress:
+        for seriesuid in sorted(completed_seriesuids):
+            progress_writer.writerow([seriesuid, ""])
+        _flush_file(progress_file)
+
+    detection_count = existing_detection_count
+    t0 = time.time()
+    total = len(pending_paths)
+
+    with torch.inference_mode():
+        for done, file_path in enumerate(pending_paths, start=1):
+            filename = os.path.basename(file_path)
             elapsed = time.time() - t0
-            eta = elapsed / done * (total - done)
+            eta = 0.0 if done == 0 else elapsed / done * (total - done)
             print(
-                f"[GPU {rank}] {done}/{total}  {os.path.basename(filenames[0])}"
+                f"{done}/{total}  {filename}"
                 f"  elapsed {elapsed:.0f}s  ETA {eta:.0f}s",
                 flush=True,
             )
 
-            inputs = [d["image"].to(device) for d in batch]
+            batch_item = preprocessing({"image": file_path})
+            inputs = [batch_item["image"].to(device)]
 
             if amp and device.type == "cuda":
                 with torch.autocast("cuda"):
                     outputs = inferer(inputs, network)
             else:
                 outputs = inferer(inputs, network)
-            del inputs
+            pred = outputs[0]
 
-            for batch_item, pred in zip(batch, outputs):
-                # Merge predictions into the batch dict so postprocessing
-                # transforms (ClipBoxToImaged, AffineBoxToWorldCoordinated)
-                # can access the image tensor and its metadata.
-                post_input = {
-                    **batch_item,
-                    "box": pred[detector.target_box_key].to(torch.float32),
-                    "label": pred[detector.target_label_key],
-                    "label_scores": pred[detector.pred_score_key].to(torch.float32),
-                }
-                post_output = postprocessing(post_input)
+            # Merge predictions into the batch dict so postprocessing
+            # transforms (ClipBoxToImaged, AffineBoxToWorldCoordinated)
+            # can access the image tensor and its metadata.
+            post_input = {
+                **batch_item,
+                "box": pred[detector.target_box_key].to(torch.float32),
+                "label": pred[detector.target_label_key],
+                "label_scores": pred[detector.pred_score_key].to(torch.float32),
+            }
+            post_output = postprocessing(post_input)
 
-                filename = batch_item["image"].meta["filename_or_obj"]
-                seriesuid = os.path.basename(filename)
-                if seriesuid.endswith(".nii.gz"):
-                    seriesuid = seriesuid[: -len(".nii.gz")]
+            seriesuid = _seriesuid_from_path(file_path)
 
-                # Post-processing converts boxes to world coordinates in
-                # "cccwhd" format: [center_x, center_y, center_z, w, h, d].
-                boxes = post_output["box"].cpu().numpy()
-                scores = post_output["label_scores"].cpu().numpy()
+            # Post-processing converts boxes to world coordinates in
+            # "cccwhd" format: [center_x, center_y, center_z, w, h, d].
+            boxes = post_output["box"].cpu().numpy()
+            scores = post_output["label_scores"].cpu().numpy()
 
-                n = len(boxes)
-                print(f"  -> {seriesuid}: {n} detection(s)", flush=True)
+            scan_rows = []
+            for box, score in zip(boxes, scores):
+                cx, cy, cz, w, h, d = box.tolist()
+                diameter_mm = (w + h + d) / 3.0
+                scan_rows.append([seriesuid, cx, cy, cz, diameter_mm, float(score)])
 
-                for box, score in zip(boxes, scores):
-                    cx, cy, cz, w, h, d = box.tolist()
-                    diameter_mm = (w + h + d) / 3.0
-                    rows.append([seriesuid, cx, cy, cz, diameter_mm, float(score)])
+            writer.writerows(scan_rows)
+            _flush_file(csv_file)
+            progress_writer.writerow([seriesuid, len(scan_rows)])
+            _flush_file(progress_file)
+            detection_count += len(scan_rows)
+            print(f"  -> {seriesuid}: {len(scan_rows)} detection(s)", flush=True)
 
+            del scan_rows, boxes, scores, post_output, post_input, pred, outputs, inputs, batch_item
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    csv_file.close()
+    progress_file.close()
     elapsed = time.time() - t0
-    print(
-        f"[GPU {rank}] Finished in {elapsed:.1f}s — {len(rows)} detection(s)",
-        flush=True,
-    )
-    result_queue.put((rank, rows))
+    print(f"Finished in {elapsed:.1f}s — {detection_count} detection(s)", flush=True)
+    return detection_count
 
 
 # ---------------------------------------------------------------------------
@@ -209,97 +311,45 @@ def run_detection(
     bundle_dir: str = str(BUNDLE_DIR),
     score_thresh: float = 0.1,
     nms_thresh: float = 0.22,
-    num_workers: int = 4,
-    num_gpus: int | None = None,
-) -> list[list]:
+    num_workers: int = 1,
+    overwrite: bool = False,
+) -> int:
     """
     Detect lung nodules in all NII.gz files inside *input_dir* and write
     results to *output_csv* in LUNA16 annotation format.
 
-    Returns the list of detection rows so callers can do further processing.
+    Returns the total number of detection rows present in the output CSV after
+    this run completes.
 
     Parameters
     ----------
     input_dir   : directory containing .nii.gz files
-    output_csv  : destination CSV file
+    output_csv  : destination CSV file (written per scan as inference progresses)
     bundle_dir  : root directory of the lung_nodule_ct_detection bundle
     score_thresh: minimum confidence score to keep a detection
     nms_thresh  : NMS IoU threshold
-    num_workers : DataLoader workers used for parallel preprocessing per GPU
-    num_gpus    : number of GPUs to use; None means all available (min 1)
+    num_workers : retained for CLI compatibility; serial processing ignores it
+                  to reduce peak memory usage
+    overwrite   : recreate the CSV/progress files instead of resuming
     """
     input_dir = os.path.expanduser(input_dir)
     bundle_dir = str(Path(bundle_dir).expanduser())
+    output_csv = os.path.expanduser(output_csv)
 
     nii_files = sorted(glob.glob(os.path.join(input_dir, "*.nii.gz")))
     if not nii_files:
         raise FileNotFoundError(f"No .nii.gz files found in {input_dir}")
     print(f"Found {len(nii_files)} NII.gz file(s) in {input_dir}")
 
-    n_cuda = torch.cuda.device_count()
-    n_gpus = num_gpus if num_gpus is not None else max(1, n_cuda)
-    n_gpus = min(n_gpus, max(1, n_cuda))
     amp = torch.cuda.is_available()
-    print(f"GPUs: {n_gpus}  AMP: {amp}")
+    print(f"AMP: {amp}")
 
-    # Distribute files round-robin across GPUs
-    chunks: list[list[str]] = [[] for _ in range(n_gpus)]
-    for i, f in enumerate(nii_files):
-        chunks[i % n_gpus].append(f)
-
-    all_rows: list[list] = []
-
-    if n_gpus == 1:
-        # Single GPU: run inline to avoid multiprocessing overhead.
-        q: mp.SimpleQueue = mp.SimpleQueue()
-        _infer_worker(
-            0, chunks[0], bundle_dir,
-            score_thresh, nms_thresh, num_workers, amp, q,
-        )
-        _, rows = q.get()
-        all_rows.extend(rows)
-    else:
-        # Multiple GPUs: spawn one process per GPU (spawn context is required
-        # for CUDA safety on Linux where the default is "fork").
-        ctx = mp.get_context("spawn")
-        q = ctx.SimpleQueue()
-        processes = []
-        for rank in range(n_gpus):
-            if not chunks[rank]:
-                continue
-            proc = ctx.Process(
-                target=_infer_worker,
-                args=(
-                    rank, chunks[rank], bundle_dir,
-                    score_thresh, nms_thresh, num_workers, amp, q,
-                ),
-            )
-            proc.start()
-            processes.append(proc)
-
-        for proc in processes:
-            proc.join()
-
-        # Collect results, preserving rank order for deterministic output.
-        results: dict[int, list] = {}
-        while not q.empty():
-            rank, rows = q.get()
-            results[rank] = rows
-        for rank in sorted(results):
-            all_rows.extend(results[rank])
-
-    # Write CSV
-    output_csv = os.path.expanduser(output_csv)
-    csv_dir = os.path.dirname(os.path.abspath(output_csv))
-    if csv_dir:
-        os.makedirs(csv_dir, exist_ok=True)
-    with open(output_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["seriesuid", "coordX", "coordY", "coordZ", "diameter_mm", "score"])
-        writer.writerows(all_rows)
-
-    print(f"\nSaved {len(all_rows)} detection(s) to {output_csv}")
-    return all_rows
+    total_rows = _infer_worker(
+        nii_files, bundle_dir, output_csv,
+        score_thresh, nms_thresh, num_workers, amp, overwrite,
+    )
+    print(f"\nSaved {total_rows} detection(s) to {output_csv}")
+    return total_rows
 
 
 # ---------------------------------------------------------------------------
@@ -315,19 +365,16 @@ def _parse_args() -> argparse.Namespace:
             "0.703 x 0.703 x 1.25 mm before inference. Results are written in\n"
             "LUNA16 annotation CSV format:\n"
             "  seriesuid, coordX, coordY, coordZ, diameter_mm\n\n"
+            "The CSV is written after each scan so progress is preserved if the\n"
+            "process is interrupted.\n\n"
             "Examples:\n"
-            "  # Run on all files in a directory (single GPU, default settings)\n"
+            "  # Run on all files in a directory\n"
             "  python3 detect_chest_ct.py --input_dir ~/chest_ct_nii\n\n"
             "  # Custom output path and lower score threshold for higher recall\n"
             "  python3 detect_chest_ct.py \\\n"
             "      --input_dir ~/chest_ct_nii \\\n"
             "      --output_csv ~/results/annotations.csv \\\n"
             "      --score_thresh 0.05\n\n"
-            "  # Use all 4 GPUs with 8 preprocessing workers each\n"
-            "  python3 detect_chest_ct.py \\\n"
-            "      --input_dir ~/chest_ct_nii \\\n"
-            "      --num_gpus 4 \\\n"
-            "      --num_workers 8\n\n"
             "  # Via MONAI bundle CLI\n"
             "  python3 -m monai.bundle run \\\n"
             "      --config_file configs/chest_ct_inference.json \\\n"
@@ -352,6 +399,7 @@ def _parse_args() -> argparse.Namespace:
             "Destination CSV file with columns: "
             "seriesuid, coordX, coordY, coordZ, diameter_mm, score. "
             "Parent directories are created automatically. "
+            "Written incrementally after each scan. "
             "(default: <script_dir>/chest_ct_nii.csv)"
         ),
     )
@@ -391,23 +439,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--num_workers",
         type=int,
-        default=4,
+        default=1,
         help=(
-            "Number of DataLoader worker processes for parallel file loading "
-            "and preprocessing (resampling, intensity scaling) per GPU. "
-            "Increase on machines with many CPU cores to reduce GPU idle time. "
-            "(default: 4)"
+            "Deprecated compatibility flag. The script now processes one scan "
+            "at a time and ignores this value to minimize peak memory usage. "
+            "(default: 1)"
         ),
     )
     p.add_argument(
-        "--num_gpus",
-        type=int,
-        default=None,
+        "--overwrite",
+        action="store_true",
         help=(
-            "Number of GPUs to use. Files are split evenly across GPUs and "
-            "each GPU runs in a separate process (spawn context). "
-            "Defaults to all available GPUs, with a minimum of 1. "
-            "(default: all available)"
+            "Start a fresh run by recreating the CSV and progress sidecar "
+            "instead of resuming from existing files."
         ),
     )
     return p.parse_args()
@@ -422,7 +466,7 @@ def main() -> None:
         score_thresh=args.score_thresh,
         nms_thresh=args.nms_thresh,
         num_workers=args.num_workers,
-        num_gpus=args.num_gpus,
+        overwrite=args.overwrite,
     )
 
 
