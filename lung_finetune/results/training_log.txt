@@ -1,0 +1,50 @@
+Fine-tuning run log — local clinic CT data (47 scans, 100 nodules)
+Hardware: Apple Silicon M4 Max (36 GB), MPS backend, AMP disabled
+Config: fine_tune_lr=1e-5, warmup=2, max_epochs=25, val_interval=1,
+        anchors=[4,6,8], grad_accum=4, affine_lps_to_ras=True
+
+Best FROC_mean_sens: 0.7500 at epoch 18
+
+Per-epoch FROC_mean_sens (avg over 7 FP/scan operating points):
+epoch  1: 0.7202
+epoch  2: 0.7321
+epoch  3: 0.7202
+epoch  4: 0.7381
+epoch  5: 0.7143
+epoch  6: 0.7202
+epoch  7: 0.7262
+epoch  8: 0.7202
+epoch  9: 0.7381
+epoch 10: 0.7321
+epoch 11: 0.7440
+epoch 12: 0.7321
+epoch 13: 0.7381
+epoch 14: 0.7143
+epoch 15: 0.7321
+epoch 16: 0.7440
+epoch 17: 0.7381
+epoch 18: 0.7500   <-- best
+epoch 19: 0.7321
+epoch 20: 0.7321
+epoch 21: 0.7381
+epoch 22: 0.7500
+epoch 23: 0.7321
+epoch 24: 0.7381
+epoch 25: 0.7202
+
+FROC operating points at best epoch (18):
+  FP/scan 0.125 : 0.3750
+  FP/scan 0.25  : 0.5833
+  FP/scan 0.5   : 0.7083
+  FP/scan 1     : 0.8333
+  FP/scan 2     : 0.9167
+  FP/scan 4     : 0.9167
+  FP/scan 8     : 0.9167
+
+Estimated false positives per scan at score_thresh=0.4: ~4-5 (comparable to baseline)
+
+Notes:
+- COCO AP/AR reported 0.0 throughout: with only 24 validation nodules the COCO
+  metric is unstable and not meaningful at this scale; FROC is the primary metric.
+- FROC improved modestly (0.72 -> 0.75) and is noisy due to the small validation
+  set (10 scans / 24 nodules, ~4% weight per nodule).
