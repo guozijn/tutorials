@@ -1,0 +1,38 @@
+{
+    "seed": 42,
+    "spatial_dims": 3,
+    "n_input_channels": 1,
+    "fg_labels": [0],
+    "num_classes": 1,
+    "gt_box_mode": "cccwhd",
+
+    "w_cls": 2.0,
+
+    "fine_tune_lr": 1e-5,
+
+    "batch_size": 2,
+    "grad_accum_steps": 4,
+
+    "patch_size": [192, 192, 80],
+    "val_patch_size": [512, 512, 208],
+
+    "returned_layers": [1, 2],
+    "conv1_t_stride": [2, 2, 1],
+
+    "base_anchor_shapes": [
+        [4.0, 4.0, 4.0],
+        [6.0, 6.0, 6.0],
+        [8.0, 8.0, 8.0]
+    ],
+
+    "balanced_sampler_pos_fraction": 0.10,
+
+    "score_thresh": 0.40,
+    "nms_thresh": 0.15,
+
+    "fine_tune_max_epochs": 25,
+    "warmup_epochs": 2,
+    "val_interval": 1,
+
+    "froc_fps_per_scan": [0.125, 0.25, 0.5, 1, 2, 4, 8]
+}

@@ -1,0 +1,19 @@
+# Never commit patient data or weights
+*.nii
+*.nii.gz
+*.mhd
+*.raw
+*.dcm
+*.pt
+*.pth
+dataset.json
+annotations.csv
+data/
+runs/
+**/imagesTr/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store

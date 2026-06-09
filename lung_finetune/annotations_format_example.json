@@ -1,0 +1,17 @@
+{
+  "_comment": "Expected MONAI Decathlon-format datalist. Real annotations are NOT included (patient privacy). This is a synthetic example showing the structure only. box format is cccwhd: [cx, cy, cz, w, h, d] in world coords; label 0 = nodule.",
+  "training": [
+    {
+      "image": "imagesTr/<anonymized_scan_id>.nii.gz",
+      "box": [[10.0, -20.0, 1500.0, 6.0, 6.0, 6.0]],
+      "label": [0]
+    }
+  ],
+  "validation": [
+    {
+      "image": "imagesTr/<anonymized_scan_id>.nii.gz",
+      "box": [[5.0, -15.0, 1480.0, 5.0, 5.0, 5.0]],
+      "label": [0]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+    "data_base_dir": "<PATH_TO>/lung_project/data",
+    "data_list_file_path": "<PATH_TO>/lung_project/data/dataset.json",
+    "model_path": "<PATH_TO>/lung_project/model_best_finetuned.pt",
+    "pretrained_model_path": "<PATH_TO>/lung_project/model_luna16_fold1.pt",
+    "tfevent_path": "<PATH_TO>/lung_project/runs"
+}
